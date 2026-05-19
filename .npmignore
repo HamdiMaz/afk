@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+.env
+.pi/
+.worktrees/
+tests/
+tsconfig.json
+eslint.config.js

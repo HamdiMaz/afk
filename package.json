@@ -1,0 +1,58 @@
+{
+  "name": "afk",
+  "version": "0.1.0",
+  "description": "A Pi package extension that allows the agent to communicate with the user when they're afk.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Hamdi Alareij",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HamdiMaz/afk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/HamdiMaz/afk/issues"
+  },
+  "homepage": "https://github.com/HamdiMaz/afk#readme",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "afk"
+  ],
+  "files": [
+    "extensions",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "tsx --test tests/**/*.test.ts",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run lint && npm test",
+    "prepublishOnly": "npm run check"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@earendil-works/pi-tui": "^0.74.0",
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.7.0",
+    "eslint": "^10.3.0",
+    "tsx": "^4.21.0",
+    "typebox": "^1.1.38",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.59.3"
+  }
+}
