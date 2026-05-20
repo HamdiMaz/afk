@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -42,13 +42,42 @@ describe("AFK config store", () => {
 		assert.match(raw, /afk_test_bot/);
 	});
 
-	it("ignores malformed config files", async () => {
+	it(
+		"creates and enforces restrictive config directory and file permissions",
+		{ skip: process.platform === "win32" ? "POSIX mode assertions do not apply on Windows" : false },
+		async () => {
+			const home = await tempHome();
+			const file = join(home, "config.json");
+			await chmod(home, 0o777);
+			await writeFile(file, "{}", { encoding: "utf8", mode: 0o666 });
+			await chmod(file, 0o666);
+
+			await writeConfig({ botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2 }, home);
+
+			assert.equal((await stat(home)).mode & 0o777, 0o700);
+			assert.equal((await stat(file)).mode & 0o777, 0o600);
+		},
+	);
+
+	it("returns undefined for invalid JSON config files", async () => {
 		const home = await tempHome();
-		await writeConfig({ botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2 }, home);
-		const file = join(home, "config.json");
-		await import("node:fs/promises").then((fs) => fs.writeFile(file, JSON.stringify({ botToken: 5 }), "utf8"));
+		await writeFile(join(home, "config.json"), "{not json", "utf8");
 
 		assert.equal(await readConfig(home), undefined);
+	});
+
+	it("returns undefined for schema-invalid config files", async () => {
+		const home = await tempHome();
+		await writeFile(join(home, "config.json"), JSON.stringify({ botToken: 5 }), "utf8");
+
+		assert.equal(await readConfig(home), undefined);
+	});
+
+	it("surfaces unexpected read errors", async () => {
+		const home = await tempHome();
+		await mkdir(join(home, "config.json"));
+
+		await assert.rejects(readConfig(home));
 	});
 
 	it("validates and redacts config", () => {
@@ -56,5 +85,14 @@ describe("AFK config store", () => {
 		assert.equal(isAfkConfig(config), true);
 		assert.equal(isAfkConfig({ botToken: "123:secret" }), false);
 		assert.deepEqual(redactConfig(config), { botToken: "<redacted>", botUsername: "bot", chatId: 1, userId: 2 });
+	});
+
+	it("rejects fractional or unsafe Telegram IDs", () => {
+		const base = { botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2 };
+
+		assert.equal(isAfkConfig({ ...base, chatId: 1.5 }), false);
+		assert.equal(isAfkConfig({ ...base, userId: 2.5 }), false);
+		assert.equal(isAfkConfig({ ...base, chatId: Number.MAX_SAFE_INTEGER + 1 }), false);
+		assert.equal(isAfkConfig({ ...base, userId: Number.MAX_SAFE_INTEGER + 1 }), false);
 	});
 });
