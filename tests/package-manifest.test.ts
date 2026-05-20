@@ -35,4 +35,16 @@ describe("package manifest", () => {
 		assert.equal(packageJson.peerDependencies?.["@mariozechner/pi-coding-agent"], undefined);
 		assert.doesNotMatch(packageJsonText, /@mariozechner\//);
 	});
+
+	it("declares Telegram runtime and Pi AI schema dependencies", () => {
+		const packageJson = JSON.parse(readFileSync(packageJsonUrl, "utf8")) as {
+			dependencies?: Record<string, string>;
+			devDependencies?: Record<string, string>;
+			peerDependencies?: Record<string, string>;
+		};
+
+		assert.equal(typeof packageJson.dependencies?.grammy, "string");
+		assert.equal(packageJson.peerDependencies?.["@earendil-works/pi-ai"], "*");
+		assert.equal(typeof packageJson.devDependencies?.["@earendil-works/pi-ai"], "string");
+	});
 });
