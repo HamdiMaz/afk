@@ -16,10 +16,13 @@ class FakeTransport implements AskQueueTransport {
 	readonly sent: ActiveTelegramQuestion[] = [];
 	readonly cancellations: string[] = [];
 	sendQuestionFailures: Array<Error | undefined> = [];
+	sendQuestionDelays: Array<Promise<void> | undefined> = [];
 	sendCancellationFailure: Error | undefined;
 
 	async sendQuestion(active: ActiveTelegramQuestion): Promise<void> {
 		this.sent.push(active);
+		const delay = this.sendQuestionDelays.shift();
+		if (delay) await delay;
 		const failure = this.sendQuestionFailures.shift();
 		if (failure) throw failure;
 	}
@@ -38,6 +41,20 @@ const rejectsSoon = async (promise: Promise<unknown>, expected: RegExp | typeof 
 		]),
 		expected,
 	);
+};
+
+const deferred = (): { promise: Promise<void>; reject: (error: Error) => void; resolve: () => void } => {
+	let reject!: (error: Error) => void;
+	let resolve!: () => void;
+	const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { promise, reject, resolve };
+};
+
+const flushAsync = async (): Promise<void> => {
+	await new Promise((resolve) => setImmediate(resolve));
 };
 
 describe("AskQueue", () => {
@@ -179,6 +196,75 @@ describe("AskQueue", () => {
 
 		assert.equal(await queue.answerWithOption("n3", 1), true);
 		assert.deepEqual(await next, [{ id: "next", value: "no", label: "No", wasCustom: false }]);
+	});
+
+	it("ignores stale first-question send failure after abort activates the next ask", async () => {
+		const transport = new FakeTransport();
+		const pendingSend = deferred();
+		transport.sendQuestionDelays.push(pendingSend.promise);
+		const nonces = ["n1", "n2"];
+		const queue = new AskQueue(transport, { makeNonce: () => nonces.shift() ?? "missing" });
+		const controller = new AbortController();
+
+		const first = queue.enqueue([question("first")], controller.signal);
+		const second = queue.enqueue([question("second")]);
+		const secondOutcome = second.then(
+			(value) => ({ status: "fulfilled" as const, value }),
+			(error: unknown) => ({ status: "rejected" as const, error }),
+		);
+		assert.equal(transport.sent.length, 1);
+		assert.equal(transport.sent[0]?.question.id, "first");
+
+		controller.abort();
+		await assert.rejects(first, AfkAskCancelledError);
+		assert.equal(transport.sent.length, 2);
+		assert.equal(transport.sent[1]?.question.id, "second");
+
+		pendingSend.reject(new Error("stale first send failed"));
+		await flushAsync();
+
+		assert.equal(await queue.answerWithOption("n2", 0), true);
+		assert.deepEqual(await secondOutcome, {
+			status: "fulfilled",
+			value: [{ id: "second", value: "yes", label: "Yes", wasCustom: false }],
+		});
+	});
+
+	it("ignores stale later-question send failure after abort activates the next ask", async () => {
+		const transport = new FakeTransport();
+		const pendingSecondSend = deferred();
+		transport.sendQuestionDelays.push(undefined, pendingSecondSend.promise);
+		const nonces = ["n1", "n2", "n3"];
+		const queue = new AskQueue(transport, { makeNonce: () => nonces.shift() ?? "missing" });
+		const controller = new AbortController();
+
+		const first = queue.enqueue([question("first"), question("later")], controller.signal);
+		const second = queue.enqueue([question("second")]);
+		const secondOutcome = second.then(
+			(value) => ({ status: "fulfilled" as const, value }),
+			(error: unknown) => ({ status: "rejected" as const, error }),
+		);
+		assert.equal(transport.sent.length, 1);
+		assert.equal(transport.sent[0]?.question.id, "first");
+
+		const firstAnswer = queue.answerWithOption("n1", 0);
+		assert.equal(transport.sent.length, 2);
+		assert.equal(transport.sent[1]?.question.id, "later");
+
+		controller.abort();
+		await assert.rejects(first, AfkAskCancelledError);
+		assert.equal(transport.sent.length, 3);
+		assert.equal(transport.sent[2]?.question.id, "second");
+
+		pendingSecondSend.reject(new Error("stale later send failed"));
+		await flushAsync();
+		assert.equal(await firstAnswer, true);
+
+		assert.equal(await queue.answerWithOption("n3", 1), true);
+		assert.deepEqual(await secondOutcome, {
+			status: "fulfilled",
+			value: [{ id: "second", value: "no", label: "No", wasCustom: false }],
+		});
 	});
 
 	it("rejects a queued ask when its abort signal fires without affecting the active ask", async () => {

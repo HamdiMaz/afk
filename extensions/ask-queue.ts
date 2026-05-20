@@ -151,18 +151,16 @@ export class AskQueue {
 		const next = this.queue.shift();
 		if (!next) return;
 
-		this.active = { ...next, questionIndex: 0, nonce: this.makeNonce() };
+		const active = { ...next, questionIndex: 0, nonce: this.makeNonce() };
+		this.active = active;
 		try {
-			await this.sendActiveQuestion();
+			await this.sendActiveQuestion(active);
 		} catch (error) {
-			await this.rejectActiveAndPump(error);
+			await this.rejectActiveAndPump(error, active);
 		}
 	}
 
-	private async sendActiveQuestion(): Promise<void> {
-		const active = this.active;
-		if (!active) return;
-
+	private async sendActiveQuestion(active: ActiveAsk): Promise<void> {
 		const question = active.questions[active.questionIndex];
 		if (!question) return;
 
@@ -190,9 +188,9 @@ export class AskQueue {
 		active.questionIndex += 1;
 		active.nonce = this.makeNonce();
 		try {
-			await this.sendActiveQuestion();
+			await this.sendActiveQuestion(active);
 		} catch (error) {
-			await this.rejectActiveAndPump(error);
+			await this.rejectActiveAndPump(error, active);
 		}
 	}
 
@@ -214,9 +212,9 @@ export class AskQueue {
 		void this.pump();
 	}
 
-	private async rejectActiveAndPump(error: unknown): Promise<void> {
+	private async rejectActiveAndPump(error: unknown, failedActive: ActiveAsk): Promise<void> {
 		const active = this.active;
-		if (!active) return;
+		if (!active || active.requestId !== failedActive.requestId) return;
 
 		active.removeAbortListener();
 		active.reject(error instanceof Error ? error : new Error(String(error)));
