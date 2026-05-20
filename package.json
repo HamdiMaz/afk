@@ -1,10 +1,10 @@
 {
-  "name": "afk",
+  "name": "pi-afk",
   "version": "0.1.0",
   "description": "A Pi package extension that allows the agent to communicate with the user when they're afk.",
   "type": "module",
   "license": "MIT",
-  "author": "Hamdi Alareij",
+  "author": "Maz Li",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/HamdiMaz/afk.git"
