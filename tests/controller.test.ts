@@ -13,6 +13,7 @@ import type { AfkConfig, AfkQuestion } from "../extensions/types.ts";
 
 class FakeBridge implements TelegramBridgePort {
 	started = false;
+	startCalls = 0;
 	stopped = false;
 	readonly messages: Array<{ chatId: number; text: string }> = [];
 	readonly questions: ActiveTelegramQuestion[] = [];
@@ -24,8 +25,9 @@ class FakeBridge implements TelegramBridgePort {
 		return { username: "fake_bot" };
 	}
 
-	start(): void {
+	async start(): Promise<void> {
 		this.started = true;
+		this.startCalls += 1;
 	}
 
 	stop(): void {
@@ -46,15 +48,19 @@ class FakeBridge implements TelegramBridgePort {
 }
 
 class FakeLock {
+	acquireCalls = 0;
+	releaseCalls = 0;
 	released = false;
 
 	constructor(private readonly result: { ok: true } | { ok: false; reason: string }) {}
 
 	async acquire(): Promise<{ ok: true } | { ok: false; reason: string }> {
+		this.acquireCalls += 1;
 		return this.result;
 	}
 
 	async release(): Promise<void> {
+		this.releaseCalls += 1;
 		this.released = true;
 	}
 }
@@ -189,7 +195,7 @@ describe("AfkController", () => {
 		let lock: FakeLock | undefined;
 		let bridge: ThrowingStartBridge | undefined;
 		class ThrowingStartBridge extends FakeBridge {
-			override start(): void {
+			override async start(): Promise<void> {
 				this.started = true;
 				throw new Error("start failed");
 			}
@@ -213,9 +219,9 @@ describe("AfkController", () => {
 		let lock: FakeLock | undefined;
 		let bridge: RejectingStartBridge | undefined;
 		class RejectingStartBridge extends FakeBridge {
-			override start(): void {
+			override start(): Promise<void> {
 				this.started = true;
-				return Promise.reject(new Error("start rejected")) as unknown as void;
+				return Promise.reject(new Error("start rejected"));
 			}
 		}
 		const controller = new AfkController({
@@ -395,15 +401,23 @@ describe("AfkController", () => {
 		assert.deepEqual(notifications, [{ message: "AFK settings cancelled.", type: "warning" }]);
 	});
 
-	it("runSettings successful link writes config and stops bridge", async () => {
+	it("runSettings successful link writes config, acquires and releases lock, and stops bridge", async () => {
 		const home = await tempHome();
 		let bridge: FakeBridge | undefined;
+		let lockToken: string | undefined;
+		let lockHome: string | undefined;
+		const lock = new FakeLock({ ok: true });
 		const { ctx, notifications } = fakeCommandCtx("999:token");
 		const controller = new AfkController({
 			home,
 			settingsLinkTimeoutMs: 100,
 			settingsPollIntervalMs: 1,
 			createBridge: (_token, handlers) => (bridge = new FakeBridge(handlers)),
+			createLock: (token, lockPath) => {
+				lockToken = token;
+				lockHome = lockPath;
+				return lock;
+			},
 		});
 
 		const settingsPromise = controller.runSettings(ctx);
@@ -414,34 +428,64 @@ describe("AfkController", () => {
 		await settingsPromise;
 
 		assert.deepEqual(await readConfig(home), { botToken: "999:token", botUsername: "fake_bot", chatId: 123, userId: 456 });
+		assert.equal(lockToken, "999:token");
+		assert.equal(lockHome, home);
+		assert.equal(lock.acquireCalls, 1);
+		assert.equal(lock.releaseCalls, 1);
 		assert.equal(bridge?.stopped, true);
 		assert.deepEqual(notifications.at(-1), { message: "AFK Telegram settings saved.", type: "info" });
 	});
 
-	it("runSettings wrong or no code times out and stops bridge with warning", async () => {
+	it("runSettings lock rejection notifies warning and does not start bridge", async () => {
 		let bridge: FakeBridge | undefined;
+		const lock = new FakeLock({ ok: false, reason: "AFK already running elsewhere" });
 		const { ctx, notifications } = fakeCommandCtx("999:token");
 		const controller = new AfkController({
 			home: await tempHome(),
 			settingsLinkTimeoutMs: 5,
 			settingsPollIntervalMs: 1,
 			createBridge: (_token, handlers) => (bridge = new FakeBridge(handlers)),
+			createLock: () => lock,
 		});
 
 		await controller.runSettings(ctx);
 
+		assert.equal(lock.acquireCalls, 1);
+		assert.equal(lock.releaseCalls, 0);
+		assert.equal(bridge?.started ?? false, false);
+		assert.deepEqual(notifications, [{ message: "AFK already running elsewhere", type: "warning" }]);
+	});
+
+	it("runSettings wrong or no code times out, releases lock, and stops bridge with warning", async () => {
+		let bridge: FakeBridge | undefined;
+		const lock = new FakeLock({ ok: true });
+		const { ctx, notifications } = fakeCommandCtx("999:token");
+		const controller = new AfkController({
+			home: await tempHome(),
+			settingsLinkTimeoutMs: 5,
+			settingsPollIntervalMs: 1,
+			createBridge: (_token, handlers) => (bridge = new FakeBridge(handlers)),
+			createLock: () => lock,
+		});
+
+		await controller.runSettings(ctx);
+
+		assert.equal(lock.acquireCalls, 1);
+		assert.equal(lock.releaseCalls, 1);
 		assert.equal(bridge?.stopped, true);
 		assert.deepEqual(notifications.at(-1), { message: "AFK Telegram link timed out.", type: "warning" });
 	});
 
-	it("runSettings polling error stops bridge and notifies warning", async () => {
+	it("runSettings polling error releases lock, stops bridge, and notifies warning", async () => {
 		let bridge: FakeBridge | undefined;
+		const lock = new FakeLock({ ok: true });
 		const { ctx, notifications } = fakeCommandCtx("999:token");
 		const controller = new AfkController({
 			home: await tempHome(),
 			settingsLinkTimeoutMs: 100,
 			settingsPollIntervalMs: 1,
 			createBridge: (_token, handlers) => (bridge = new FakeBridge(handlers)),
+			createLock: () => lock,
 		});
 
 		const settingsPromise = controller.runSettings(ctx);
@@ -449,6 +493,8 @@ describe("AfkController", () => {
 		bridge?.handlers.onPollingError?.(new Error("poll failed"));
 		await settingsPromise;
 
+		assert.equal(lock.acquireCalls, 1);
+		assert.equal(lock.releaseCalls, 1);
 		assert.equal(bridge?.stopped, true);
 		assert.deepEqual(notifications.at(-1), { message: "AFK Telegram polling failed during settings link.", type: "warning" });
 	});

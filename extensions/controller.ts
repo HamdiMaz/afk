@@ -83,7 +83,7 @@ export class AfkController implements AskQueueTransport {
 			this.config = config;
 			this.lock = lock;
 			this.bridge = bridge;
-			await Promise.resolve((bridge.start as () => void | Promise<void>)());
+			await bridge.start();
 			this.afkEnabled = true;
 			return { ok: true };
 		} catch (error) {
@@ -182,6 +182,13 @@ export class AfkController implements AskQueueTransport {
 		}
 
 		const code = `AFK-${Math.floor(100_000 + Math.random() * 900_000)}`;
+		const lock = this.createLock(token, this.home);
+		const acquired = await lock.acquire();
+		if (!acquired.ok) {
+			ctx.ui.notify(acquired.reason, "warning");
+			return;
+		}
+
 		let linked = false;
 		let pollingError: unknown;
 		let bridge: TelegramBridgePort | undefined;
@@ -204,7 +211,7 @@ export class AfkController implements AskQueueTransport {
 			});
 
 			const me = await bridge.getMe();
-			await Promise.resolve((bridge.start as () => void | Promise<void>)());
+			await bridge.start();
 			ctx.ui.notify(`Send this one-time code to @${me.username}: ${code}`, "info");
 
 			const deadline = Date.now() + this.settingsLinkTimeoutMs;
@@ -225,7 +232,11 @@ export class AfkController implements AskQueueTransport {
 		} catch {
 			ctx.ui.notify("AFK Telegram settings failed.", "error");
 		} finally {
-			bridge?.stop();
+			try {
+				bridge?.stop();
+			} finally {
+				await lock.release();
+			}
 		}
 	}
 

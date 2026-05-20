@@ -14,8 +14,10 @@ class FakeBot {
 	readonly handlers = new Map<string, (ctx: unknown) => Promise<void> | void>();
 	readonly sentMessages: Array<{ chatId: number; text: string; options?: unknown }> = [];
 	readonly answeredCallbacks: Array<{ callbackQueryId: string; options?: unknown }> = [];
+	initCalls = 0;
 	startCalls = 0;
 	stopCalls = 0;
+	initError: Error | undefined;
 	catchHandler: ((error: unknown) => void) | undefined;
 	api = {
 		getMe: async () => ({ username: "afk_bot", first_name: "AFK" }),
@@ -33,6 +35,11 @@ class FakeBot {
 
 	catch(handler: (error: unknown) => void): void {
 		this.catchHandler = handler;
+	}
+
+	async init(): Promise<void> {
+		this.initCalls += 1;
+		if (this.initError) throw this.initError;
 	}
 
 	start(): Promise<void> {
@@ -162,14 +169,37 @@ describe("TelegramBridge", () => {
 		assert.ok((fakeBot.sentMessages[0]?.options as { reply_markup?: unknown } | undefined)?.reply_markup);
 	});
 
-	it("starts idempotently and stop stops polling and clears state", () => {
+	it("start awaits init failure and does not start polling when init fails", async () => {
+		const fakeBot = new FakeBot();
+		const initError = new Error("invalid token");
+		fakeBot.initError = initError;
+		const bridge = new TelegramBridge("test-token", { onText: () => undefined }, fakeBot);
+
+		await assert.rejects(() => bridge.start(), /invalid token/);
+
+		assert.equal(fakeBot.initCalls, 1);
+		assert.equal(fakeBot.startCalls, 0);
+	});
+
+	it("successful start calls init and start once and remains idempotent", async () => {
 		const fakeBot = new FakeBot();
 		const bridge = new TelegramBridge("test-token", { onText: () => undefined }, fakeBot);
 
-		bridge.start();
-		bridge.start();
+		await bridge.start();
+		await bridge.start();
+
+		assert.equal(fakeBot.initCalls, 1);
+		assert.equal(fakeBot.startCalls, 1);
+	});
+
+	it("starts idempotently and stop stops polling and clears state", async () => {
+		const fakeBot = new FakeBot();
+		const bridge = new TelegramBridge("test-token", { onText: () => undefined }, fakeBot);
+
+		await bridge.start();
+		await bridge.start();
 		bridge.stop();
-		bridge.start();
+		await bridge.start();
 
 		assert.equal(fakeBot.startCalls, 2);
 		assert.equal(fakeBot.stopCalls, 1);

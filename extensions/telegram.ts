@@ -13,6 +13,7 @@ export interface TelegramBridgeHandlers {
 interface TelegramBotLike {
 	on(event: "message:text" | "callback_query:data", handler: (ctx: TelegramContextLike) => void | Promise<void>): void;
 	catch?(handler: (error: unknown) => void): void;
+	init(): Promise<void>;
 	start(): void | Promise<void>;
 	stop(): void;
 	api: {
@@ -31,7 +32,7 @@ interface TelegramContextLike {
 
 export interface TelegramBridgePort {
 	getMe(): Promise<{ username: string }>;
-	start(): void;
+	start(): Promise<void>;
 	stop(): void;
 	sendMessage(chatId: number, text: string): Promise<void>;
 	sendQuestion(config: Pick<AfkConfig, "chatId">, active: ActiveTelegramQuestion): Promise<void>;
@@ -64,13 +65,18 @@ export class TelegramBridge implements TelegramBridgePort {
 		return { username: me.username ?? me.first_name };
 	}
 
-	start(): void {
+	async start(): Promise<void> {
 		if (this.pollingPromise) return;
 
-		this.pollingPromise = Promise.resolve(this.bot.start()).catch((error: unknown) => {
-			this.pollingPromise = undefined;
-			this.reportPollingError(error);
-		});
+		await this.bot.init();
+		if (this.pollingPromise) return;
+
+		this.pollingPromise = Promise.resolve()
+			.then(() => this.bot.start())
+			.catch((error: unknown) => {
+				this.pollingPromise = undefined;
+				this.reportPollingError(error);
+			});
 	}
 
 	stop(): void {
