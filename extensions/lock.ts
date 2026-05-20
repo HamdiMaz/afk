@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, link, lstat, mkdir, open, readFile, rm, stat, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { getAfkHome } from "./config.ts";
 
@@ -24,6 +24,7 @@ interface LegacyAfkLockOptions extends AfkLockOptions {
 }
 
 const DEFAULT_INVALID_LOCK_STALE_MS = 30_000;
+const OWNER_FILE = "owner.json";
 
 export function lockPathForToken(token: string, home = getAfkHome()): string {
 	const hash = createHash("sha256").update(token).digest("hex").slice(0, 32);
@@ -68,26 +69,47 @@ function sameOwner(left: LockOwner, right: LockOwner): boolean {
 	return left.pid === right.pid && left.createdAt === right.createdAt && left.cwd === right.cwd;
 }
 
-async function syncDirectory(path: string): Promise<void> {
-	const handle = await open(path, "r");
+async function fsyncDirectory(path: string): Promise<void> {
+	if (process.platform === "win32") return;
+
+	let handle;
 	try {
+		handle = await open(path, "r");
 		await handle.sync();
+	} catch (error) {
+		if (error && typeof error === "object" && "code" in error) {
+			const code = error.code;
+			if (code === "EINVAL" || code === "ENOTSUP" || code === "EISDIR" || code === "EPERM") return;
+		}
+		throw error;
 	} finally {
-		await handle.close();
+		await handle?.close();
 	}
 }
 
-async function safeRemoveIfUnchanged(path: string, expectedRaw: string): Promise<boolean> {
-	let currentRaw: string;
+async function validateExistingDirectory(path: string, label: string): Promise<boolean> {
+	let info;
 	try {
-		currentRaw = await readFile(path, "utf8");
+		info = await lstat(path);
 	} catch (error) {
 		if (hasErrorCode(error, "ENOENT")) return false;
 		throw error;
 	}
-	if (currentRaw !== expectedRaw) return false;
-	await rm(path, { force: true });
+
+	if (info.isSymbolicLink()) throw new Error(`${label} is a symlink: ${path}`);
+	if (!info.isDirectory()) throw new Error(`${label} must be a real directory: ${path}`);
 	return true;
+}
+
+async function writeSyncedFile(path: string, content: string): Promise<void> {
+	let handle;
+	try {
+		handle = await open(path, "wx", 0o600);
+		await handle.writeFile(content, "utf8");
+		await handle.sync();
+	} finally {
+		await handle?.close();
+	}
 }
 
 export class AfkLock {
@@ -95,6 +117,7 @@ export class AfkLock {
 	private readonly home: string;
 	private readonly path: string;
 	private readonly lockDir: string;
+	private readonly ownerPath: string;
 	private readonly pid: number;
 	private readonly cwd: string;
 	private readonly isProcessAlive: (pid: number) => boolean;
@@ -114,6 +137,7 @@ export class AfkLock {
 		}
 		this.path = lockPathForToken(this.token, this.home);
 		this.lockDir = join(this.home, "locks");
+		this.ownerPath = join(this.path, OWNER_FILE);
 		this.pid = options.pid ?? process.pid;
 		this.cwd = options.cwd ?? process.cwd();
 		this.isProcessAlive = options.isProcessAlive ?? defaultIsProcessAlive;
@@ -125,21 +149,20 @@ export class AfkLock {
 
 		for (;;) {
 			const owner: LockOwner = { pid: this.pid, createdAt: Date.now(), cwd: this.cwd };
-			const rawOwner = `${JSON.stringify(owner)}\n`;
-			const publishResult = await this.tryPublishOwner(rawOwner);
+			const publishResult = await this.tryCreateLockDirectory(owner);
 			if (publishResult === "published") {
 				this.acquiredOwner = owner;
 				return { ok: true };
 			}
 
-			const existing = await this.readExistingLock();
+			const existing = await this.readExistingLock(this.path);
 			if (!existing) continue;
 
 			if (!existing.owner) {
-				if (!(await this.isInvalidLockStale())) {
-					return { ok: false, reason: "lock file is invalid and fresh" };
+				if (!(await this.isInvalidLockStale(this.path))) {
+					return { ok: false, reason: "lock owner metadata is invalid and fresh" };
 				}
-				if (await safeRemoveIfUnchanged(this.path, existing.raw)) continue;
+				if (await this.claimAndRemoveStaleLock(existing)) continue;
 				return { ok: false, reason: "lock changed during invalid cleanup" };
 			}
 
@@ -147,8 +170,8 @@ export class AfkLock {
 				return { ok: false, owner: existing.owner, reason: "owner process is alive" };
 			}
 
-			if (await safeRemoveIfUnchanged(this.path, existing.raw)) continue;
-			const changed = await this.readExistingLock();
+			if (await this.claimAndRemoveStaleLock(existing)) continue;
+			const changed = await this.readExistingLock(this.path);
 			if (changed?.owner) return { ok: false, owner: changed.owner, reason: "lock changed during stale cleanup" };
 			return { ok: false, reason: "lock changed during stale cleanup" };
 		}
@@ -156,69 +179,115 @@ export class AfkLock {
 
 	async release(): Promise<void> {
 		if (!this.acquiredOwner) return;
-		const existing = await this.readExistingLock();
+		const existing = await this.readExistingLock(this.path);
 		if (existing?.owner && sameOwner(existing.owner, this.acquiredOwner)) {
-			await safeRemoveIfUnchanged(this.path, existing.raw);
+			await rm(this.path, { recursive: true, force: true });
+			await fsyncDirectory(this.lockDir);
 		}
 		this.acquiredOwner = undefined;
 	}
 
 	private async ensureLockDir(): Promise<void> {
-		await mkdir(this.home, { recursive: true, mode: 0o700 });
+		const homeExists = await validateExistingDirectory(this.home, "AFK home");
+		if (!homeExists) await mkdir(this.home, { recursive: true, mode: 0o700 });
+		await chmod(this.home, 0o700);
+
 		try {
 			await mkdir(this.lockDir, { mode: 0o700 });
+			await fsyncDirectory(this.home);
 		} catch (error) {
 			if (!hasErrorCode(error, "EEXIST")) throw error;
 		}
 
-		const info = await lstat(this.lockDir);
-		if (info.isSymbolicLink() || !info.isDirectory()) {
-			throw new Error(`lock directory must be a real directory: ${this.lockDir}`);
-		}
+		await validateExistingDirectory(this.lockDir, "lock directory");
 		await chmod(this.lockDir, 0o700);
-		await syncDirectory(this.lockDir);
+		await fsyncDirectory(this.lockDir);
 	}
 
-	private async tryPublishOwner(rawOwner: string): Promise<"published" | "exists"> {
-		const tempPath = join(this.lockDir, `.${basename(this.path)}.${process.pid}.${randomUUID()}.tmp`);
-		let handle;
+	private async tryCreateLockDirectory(owner: LockOwner): Promise<"published" | "exists"> {
 		try {
-			handle = await open(tempPath, "wx", 0o600);
-			await handle.writeFile(rawOwner, "utf8");
-			await handle.sync();
-		} finally {
-			await handle?.close();
+			await mkdir(this.path, { mode: 0o700 });
+		} catch (error) {
+			if (hasErrorCode(error, "EEXIST")) return "exists";
+			throw error;
 		}
 
 		try {
-			await link(tempPath, this.path);
-			await unlink(tempPath);
-			await syncDirectory(this.lockDir);
+			await writeSyncedFile(this.ownerPath, `${JSON.stringify(owner)}\n`);
+			await fsyncDirectory(this.path);
+			await fsyncDirectory(this.lockDir);
 			return "published";
 		} catch (error) {
-			await rm(tempPath, { force: true });
-			if (hasErrorCode(error, "EEXIST")) return "exists";
+			await rm(this.path, { recursive: true, force: true });
+			await fsyncDirectory(this.lockDir);
 			throw error;
 		}
 	}
 
-	private async readExistingLock(): Promise<{ raw: string; owner: LockOwner | undefined } | undefined> {
+	private async readExistingLock(path: string): Promise<{ raw: string | undefined; owner: LockOwner | undefined } | undefined> {
+		let info;
 		try {
-			const raw = await readFile(this.path, "utf8");
-			return { raw, owner: parseLockOwner(raw) };
+			info = await lstat(path);
 		} catch (error) {
 			if (hasErrorCode(error, "ENOENT")) return undefined;
 			throw error;
 		}
+
+		if (info.isSymbolicLink() || !info.isDirectory()) {
+			throw new Error(`lock path exists but is not a directory: ${path}`);
+		}
+
+		try {
+			const raw = await readFile(join(path, OWNER_FILE), "utf8");
+			return { raw, owner: parseLockOwner(raw) };
+		} catch (error) {
+			if (hasErrorCode(error, "ENOENT")) return { raw: undefined, owner: undefined };
+			throw error;
+		}
 	}
 
-	private async isInvalidLockStale(): Promise<boolean> {
+	private async isInvalidLockStale(path: string): Promise<boolean> {
 		try {
-			const info = await stat(this.path);
-			return Date.now() - info.mtimeMs > this.invalidLockStaleMs;
+			const directoryInfo = await stat(path);
+			let newestMetadataMtime = directoryInfo.mtimeMs;
+			try {
+				const ownerInfo = await stat(join(path, OWNER_FILE));
+				newestMetadataMtime = Math.max(newestMetadataMtime, ownerInfo.mtimeMs);
+			} catch (error) {
+				if (!hasErrorCode(error, "ENOENT")) throw error;
+			}
+			return Date.now() - newestMetadataMtime > this.invalidLockStaleMs;
 		} catch (error) {
 			if (hasErrorCode(error, "ENOENT")) return false;
 			throw error;
 		}
+	}
+
+	private async claimAndRemoveStaleLock(expected: { raw: string | undefined; owner: LockOwner | undefined }): Promise<boolean> {
+		const claimPath = join(this.lockDir, `.${basename(this.path)}.${process.pid}.${randomUUID()}.stale`);
+		try {
+			await rename(this.path, claimPath);
+			await fsyncDirectory(this.lockDir);
+		} catch (error) {
+			if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "EEXIST")) return false;
+			throw error;
+		}
+
+		const claimed = await this.readExistingLock(claimPath);
+		if (!claimed || !this.sameLockMetadata(claimed, expected)) return false;
+
+		await rm(claimPath, { recursive: true, force: true });
+		await fsyncDirectory(this.lockDir);
+		return true;
+	}
+
+	private sameLockMetadata(
+		left: { raw: string | undefined; owner: LockOwner | undefined },
+		right: { raw: string | undefined; owner: LockOwner | undefined },
+	): boolean {
+		if (left.raw !== right.raw) return false;
+		if (!left.owner && !right.owner) return true;
+		if (!left.owner || !right.owner) return false;
+		return sameOwner(left.owner, right.owner);
 	}
 }
