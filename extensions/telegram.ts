@@ -71,12 +71,20 @@ export class TelegramBridge implements TelegramBridgePort {
 		await this.bot.init();
 		if (this.pollingPromise) return;
 
-		this.pollingPromise = Promise.resolve()
-			.then(() => this.bot.start())
-			.catch((error: unknown) => {
-				this.pollingPromise = undefined;
-				this.reportPollingError(error);
-			});
+		let pollingResult: void | Promise<void>;
+		try {
+			pollingResult = this.bot.start();
+		} catch (error) {
+			this.pollingPromise = undefined;
+			throw error;
+		}
+
+		const polling = Promise.resolve(pollingResult);
+		this.pollingPromise = polling.catch((error: unknown) => {
+			this.pollingPromise = undefined;
+			this.reportPollingError(error);
+		});
+		await this.observeImmediatePollingFailure(polling);
 	}
 
 	stop(): void {
@@ -138,6 +146,16 @@ export class TelegramBridge implements TelegramBridgePort {
 			}
 			this.reportPollingError(error);
 		}
+	}
+
+	private async observeImmediatePollingFailure(polling: Promise<void>): Promise<void> {
+		const stillPolling = Symbol("stillPolling");
+		await Promise.race([
+			polling,
+			new Promise<typeof stillPolling>((resolve) => {
+				setImmediate(() => resolve(stillPolling));
+			}),
+		]);
 	}
 
 	private async isolateHandlerError(handler: () => void | Promise<void>): Promise<void> {

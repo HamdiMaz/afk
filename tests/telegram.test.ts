@@ -18,6 +18,8 @@ class FakeBot {
 	startCalls = 0;
 	stopCalls = 0;
 	initError: Error | undefined;
+	startError: Error | undefined;
+	startPromise: Promise<void> | undefined;
 	catchHandler: ((error: unknown) => void) | undefined;
 	api = {
 		getMe: async () => ({ username: "afk_bot", first_name: "AFK" }),
@@ -44,7 +46,8 @@ class FakeBot {
 
 	start(): Promise<void> {
 		this.startCalls += 1;
-		return new Promise(() => undefined);
+		if (this.startError) throw this.startError;
+		return this.startPromise ?? new Promise(() => undefined);
 	}
 
 	stop(): void {
@@ -179,6 +182,55 @@ describe("TelegramBridge", () => {
 
 		assert.equal(fakeBot.initCalls, 1);
 		assert.equal(fakeBot.startCalls, 0);
+	});
+
+	it("start rejects when polling throws synchronously and leaves polling stopped", async () => {
+		const fakeBot = new FakeBot();
+		const startError = new Error("polling failed synchronously");
+		fakeBot.startError = startError;
+		const bridge = new TelegramBridge("test-token", { onText: () => undefined }, fakeBot);
+
+		await assert.rejects(() => bridge.start(), /polling failed synchronously/);
+		bridge.stop();
+
+		assert.equal(fakeBot.initCalls, 1);
+		assert.equal(fakeBot.startCalls, 1);
+		assert.equal(fakeBot.stopCalls, 0);
+	});
+
+	it("start rejects when polling rejects immediately and reports the polling error", async () => {
+		const fakeBot = new FakeBot();
+		const startError = new Error("polling rejected immediately");
+		fakeBot.startPromise = Promise.reject(startError);
+		let reported: unknown;
+		const bridge = new TelegramBridge(
+			"test-token",
+			{
+				onText: () => undefined,
+				onPollingError: (error) => {
+					reported = error;
+				},
+			},
+			fakeBot,
+		);
+
+		await assert.rejects(() => bridge.start(), /polling rejected immediately/);
+		bridge.stop();
+
+		assert.equal(reported, startError);
+		assert.equal(fakeBot.initCalls, 1);
+		assert.equal(fakeBot.startCalls, 1);
+		assert.equal(fakeBot.stopCalls, 0);
+	});
+
+	it("successful start resolves promptly while polling remains active", async () => {
+		const fakeBot = new FakeBot();
+		const bridge = new TelegramBridge("test-token", { onText: () => undefined }, fakeBot);
+
+		await bridge.start();
+
+		assert.equal(fakeBot.initCalls, 1);
+		assert.equal(fakeBot.startCalls, 1);
 	});
 
 	it("successful start calls init and start once and remains idempotent", async () => {
