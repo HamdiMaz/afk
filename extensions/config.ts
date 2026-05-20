@@ -34,8 +34,8 @@ export function isAfkConfig(value: unknown): value is AfkConfig {
 
 function cleanConfig(config: AfkConfig): AfkConfig {
 	return {
-		botToken: config.botToken,
-		botUsername: config.botUsername,
+		botToken: config.botToken.trim(),
+		botUsername: config.botUsername.trim(),
 		chatId: config.chatId,
 		userId: config.userId,
 	};
@@ -73,20 +73,39 @@ async function prepareAfkHomeForWrite(home: string): Promise<void> {
 	await chmod(home, 0o700);
 }
 
+async function validateConfigFile(path: string): Promise<boolean> {
+	let stats;
+	try {
+		stats = await lstat(path);
+	} catch (error) {
+		if (hasErrorCode(error, "ENOENT")) return false;
+		throw error;
+	}
+
+	if (stats.isSymbolicLink()) throw new Error(`Unsafe AFK config file: ${path} is a symlink`);
+	if (!stats.isFile()) throw new Error(`Unsafe AFK config file: ${path} is not a regular file`);
+	return true;
+}
+
 export async function readConfig(home = getAfkHome()): Promise<AfkConfig | undefined> {
 	const exists = await validateExistingAfkHome(home);
 	if (!exists) return undefined;
 
+	const targetPath = configPath(home);
+	const configExists = await validateConfigFile(targetPath);
+	if (!configExists) return undefined;
+
 	let raw;
 	try {
-		raw = await readFile(configPath(home), "utf8");
+		raw = await readFile(targetPath, "utf8");
 	} catch (error) {
 		if (hasErrorCode(error, "ENOENT")) return undefined;
 		throw error;
 	}
 
 	await chmod(home, 0o700);
-	await chmod(configPath(home), 0o600);
+	await validateConfigFile(targetPath);
+	await chmod(targetPath, 0o600);
 
 	try {
 		const parsed = JSON.parse(raw) as unknown;
@@ -122,6 +141,7 @@ export async function writeConfig(config: AfkConfig, home = getAfkHome()): Promi
 	await prepareAfkHomeForWrite(home);
 
 	const targetPath = configPath(home);
+	await validateConfigFile(targetPath);
 	const tempPath = join(home, `.config.json.${process.pid}.${randomUUID()}.tmp`);
 	let handle;
 
@@ -133,6 +153,7 @@ export async function writeConfig(config: AfkConfig, home = getAfkHome()): Promi
 		handle = undefined;
 		await chmod(tempPath, 0o600);
 		await rename(tempPath, targetPath);
+		await validateConfigFile(targetPath);
 		await chmod(targetPath, 0o600);
 		await fsyncDirectory(home);
 	} catch (error) {

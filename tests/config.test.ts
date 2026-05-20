@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { getAfkHome, isAfkConfig, readConfig, redactConfig, writeConfig } from "../extensions/config.ts";
+import { configPath, getAfkHome, isAfkConfig, readConfig, redactConfig, writeConfig } from "../extensions/config.ts";
 import type { AfkConfig } from "../extensions/types.ts";
 
 async function tempHome(): Promise<string> {
@@ -24,6 +24,10 @@ describe("AFK config store", () => {
 	it("trims PI_AFK_HOME overrides", () => {
 		const home = getAfkHome({ PI_AFK_HOME: "  /tmp/custom-afk  ", HOME: "/home/test-user" });
 		assert.equal(home, "/tmp/custom-afk");
+	});
+
+	it("resolves the config file path inside AFK home", () => {
+		assert.equal(configPath("/tmp/afk"), join("/tmp/afk", "config.json"));
 	});
 
 	it("returns undefined when config does not exist", async () => {
@@ -165,6 +169,53 @@ describe("AFK config store", () => {
 		},
 	);
 
+	it(
+		"rejects symlink config files on read without chmoding the target",
+		{ skip: process.platform === "win32" ? "POSIX symlink assertions do not apply on Windows" : false },
+		async () => {
+			const base = await tempHome();
+			const home = join(base, "home");
+			const target = join(base, "target-config.json");
+			const file = join(home, "config.json");
+			await mkdir(home);
+			await writeFile(
+				target,
+				JSON.stringify({ botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2 }),
+				{ encoding: "utf8", mode: 0o666 },
+			);
+			await chmod(target, 0o666);
+			await symlink(target, file, "file");
+
+			await assert.rejects(readConfig(home), /symlink/i);
+			assert.equal((await lstat(file)).isSymbolicLink(), true);
+			assert.equal(await readFile(target, "utf8"), JSON.stringify({ botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2 }));
+			assert.equal((await stat(target)).mode & 0o777, 0o666);
+		},
+	);
+
+	it(
+		"rejects symlink config files on write without following or overwriting the target",
+		{ skip: process.platform === "win32" ? "POSIX symlink assertions do not apply on Windows" : false },
+		async () => {
+			const base = await tempHome();
+			const home = join(base, "home");
+			const target = join(base, "target-config.json");
+			const file = join(home, "config.json");
+			await mkdir(home);
+			await writeFile(target, "do not overwrite", { encoding: "utf8", mode: 0o666 });
+			await chmod(target, 0o666);
+			await symlink(target, file, "file");
+
+			await assert.rejects(
+				writeConfig({ botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2 }, home),
+				/symlink/i,
+			);
+			assert.equal((await lstat(file)).isSymbolicLink(), true);
+			assert.equal(await readFile(target, "utf8"), "do not overwrite");
+			assert.equal((await stat(target)).mode & 0o777, 0o666);
+		},
+	);
+
 	it("drops extra properties while reading valid config files", async () => {
 		const home = await tempHome();
 		await writeFile(
@@ -189,6 +240,35 @@ describe("AFK config store", () => {
 			chatId: 1,
 			userId: 2,
 		});
+	});
+
+	it("trims bot token and username while reading config files", async () => {
+		const home = await tempHome();
+		await writeFile(
+			join(home, "config.json"),
+			JSON.stringify({ botToken: "  123:secret\n", botUsername: "\tafk_test_bot  ", chatId: 1, userId: 2 }),
+			"utf8",
+		);
+
+		assert.deepEqual(await readConfig(home), { botToken: "123:secret", botUsername: "afk_test_bot", chatId: 1, userId: 2 });
+	});
+
+	it("trims bot token and username while writing config files", async () => {
+		const home = await tempHome();
+		await writeConfig({ botToken: "  123:secret\n", botUsername: "\tafk_test_bot  ", chatId: 1, userId: 2 }, home);
+
+		assert.deepEqual(JSON.parse(await readFile(join(home, "config.json"), "utf8")), {
+			botToken: "123:secret",
+			botUsername: "afk_test_bot",
+			chatId: 1,
+			userId: 2,
+		});
+	});
+
+	it("trims bot token and username while redacting config", () => {
+		const config: AfkConfig = { botToken: "  123:secret\n", botUsername: "\tafk_test_bot  ", chatId: 1, userId: 2 };
+
+		assert.deepEqual(redactConfig(config), { botToken: "<redacted>", botUsername: "afk_test_bot", chatId: 1, userId: 2 });
 	});
 
 	it("validates and redacts config", () => {
