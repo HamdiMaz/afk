@@ -27,7 +27,7 @@ export function parseCallbackData(data: string): ParsedCallbackData | undefined 
 	if (prefix !== "afk" || !nonce || !rawOptionIndex) return undefined;
 
 	const optionIndex = Number(rawOptionIndex);
-	if (!Number.isSafeInteger(optionIndex)) return undefined;
+	if (!Number.isSafeInteger(optionIndex) || optionIndex < 0) return undefined;
 
 	return { nonce, optionIndex };
 }

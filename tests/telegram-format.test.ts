@@ -31,6 +31,8 @@ describe("telegram formatting", () => {
 	it("returns undefined for invalid callback data", () => {
 		assert.equal(parseCallbackData("other:abc123:2"), undefined);
 		assert.equal(parseCallbackData("afk:abc123:not-a-number"), undefined);
+		assert.equal(parseCallbackData("afk:abc123:-1"), undefined);
+		assert.equal(parseCallbackData("afk:abc123:1.5"), undefined);
 		assert.equal(parseCallbackData("afk::1"), undefined);
 		assert.equal(parseCallbackData("afk:abc123:1:extra"), undefined);
 	});

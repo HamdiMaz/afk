@@ -4,9 +4,29 @@ import type { AfkConfig, LinkedTelegramCallback, LinkedTelegramMessage } from ".
 import { buildQuestionPayload } from "./telegram-format.ts";
 
 export interface TelegramBridgeHandlers {
-	onMessage(message: LinkedTelegramMessage): void | Promise<void>;
-	onCallback(callback: LinkedTelegramCallback): void | Promise<void>;
+	onText?: (message: LinkedTelegramMessage) => void | Promise<void>;
+	onMessage?: (message: LinkedTelegramMessage) => void | Promise<void>;
+	onCallback?: (callback: LinkedTelegramCallback) => void | Promise<void>;
 	onPollingError?: (error: unknown) => void;
+}
+
+interface TelegramBotLike {
+	on(event: "message:text" | "callback_query:data", handler: (ctx: TelegramContextLike) => void | Promise<void>): void;
+	catch?(handler: (error: unknown) => void): void;
+	start(): void | Promise<void>;
+	stop(): void;
+	api: {
+		getMe(): Promise<{ username?: string; first_name: string }>;
+		sendMessage(chatId: number, text: string, options?: unknown): Promise<void>;
+		answerCallbackQuery(callbackQueryId: string, options?: { text: string }): Promise<void>;
+	};
+}
+
+interface TelegramContextLike {
+	chat: { id: number; type?: string };
+	from: { id: number };
+	message: { text: string };
+	callbackQuery: { id: string; data: string; message?: { chat: { id: number } } };
 }
 
 export interface TelegramBridgePort {
@@ -19,28 +39,24 @@ export interface TelegramBridgePort {
 }
 
 export class TelegramBridge implements TelegramBridgePort {
-	private readonly bot: Bot;
+	private readonly bot: TelegramBotLike;
 	private pollingPromise: Promise<void> | undefined;
 
-	constructor(token: string, private readonly handlers: TelegramBridgeHandlers) {
-		this.bot = new Bot(token);
-		this.bot.on("message:text", async (ctx) => {
-			await this.handlers.onMessage({
-				chatId: ctx.chat.id,
-				userId: ctx.from.id,
-				text: ctx.message.text,
-				isPrivate: ctx.chat.type === "private",
-			});
-		});
-		this.bot.on("callback_query:data", async (ctx) => {
-			const message = ctx.callbackQuery.message;
-			await this.handlers.onCallback({
-				callbackQueryId: ctx.callbackQuery.id,
-				chatId: message?.chat.id ?? 0,
-				userId: ctx.from.id,
-				data: ctx.callbackQuery.data,
-			});
-		});
+	constructor(token: string, private readonly handlers: TelegramBridgeHandlers, bot?: TelegramBotLike) {
+		this.bot = bot ?? (new Bot(token) as unknown as TelegramBotLike);
+		this.bot.on("message:text", (ctx) =>
+			this.isolateHandlerError(async () => {
+				const handler = this.handlers.onText ?? this.handlers.onMessage;
+				await handler?.({
+					chatId: ctx.chat.id,
+					userId: ctx.from.id,
+					text: ctx.message.text,
+					isPrivate: ctx.chat.type === "private",
+				});
+			}),
+		);
+		this.bot.on("callback_query:data", (ctx) => this.handleCallbackQuery(ctx));
+		this.bot.catch?.((error) => this.reportPollingError(error));
 	}
 
 	async getMe(): Promise<{ username: string }> {
@@ -51,9 +67,9 @@ export class TelegramBridge implements TelegramBridgePort {
 	start(): void {
 		if (this.pollingPromise) return;
 
-		this.pollingPromise = this.bot.start().catch((error: unknown) => {
+		this.pollingPromise = Promise.resolve(this.bot.start()).catch((error: unknown) => {
 			this.pollingPromise = undefined;
-			this.handlers.onPollingError?.(error);
+			this.reportPollingError(error);
 		});
 	}
 
@@ -62,7 +78,7 @@ export class TelegramBridge implements TelegramBridgePort {
 		try {
 			this.bot.stop();
 		} catch (error) {
-			this.handlers.onPollingError?.(error);
+			this.reportPollingError(error);
 		} finally {
 			this.pollingPromise = undefined;
 		}
@@ -91,5 +107,46 @@ export class TelegramBridge implements TelegramBridgePort {
 			return;
 		}
 		await this.bot.api.answerCallbackQuery(callbackQueryId);
+	}
+
+	private async handleCallbackQuery(ctx: TelegramContextLike): Promise<void> {
+		const { callbackQuery } = ctx;
+		const message = callbackQuery.message;
+		if (!message) {
+			await this.isolateHandlerError(() => this.answerCallback(callbackQuery.id));
+			return;
+		}
+
+		try {
+			await this.handlers.onCallback?.({
+				callbackQueryId: callbackQuery.id,
+				chatId: message.chat.id,
+				userId: ctx.from.id,
+				data: callbackQuery.data,
+			});
+		} catch (error) {
+			try {
+				await this.answerCallback(callbackQuery.id);
+			} catch (answerError) {
+				this.reportPollingError(answerError);
+			}
+			this.reportPollingError(error);
+		}
+	}
+
+	private async isolateHandlerError(handler: () => void | Promise<void>): Promise<void> {
+		try {
+			await handler();
+		} catch (error) {
+			this.reportPollingError(error);
+		}
+	}
+
+	private reportPollingError(error: unknown): void {
+		try {
+			this.handlers.onPollingError?.(error);
+		} catch {
+			// Keep polling alive even if the error reporter fails.
+		}
 	}
 }
