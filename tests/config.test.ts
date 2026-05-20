@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -91,19 +91,37 @@ describe("AFK config store", () => {
 		},
 	);
 
-	it("returns undefined for invalid JSON config files", async () => {
-		const home = await tempHome();
-		await writeFile(join(home, "config.json"), "{not json", "utf8");
+	it(
+		"repairs permissive permissions while reading invalid JSON config files",
+		{ skip: process.platform === "win32" ? "POSIX mode assertions do not apply on Windows" : false },
+		async () => {
+			const home = await tempHome();
+			const file = join(home, "config.json");
+			await chmod(home, 0o777);
+			await writeFile(file, "{not json", { encoding: "utf8", mode: 0o666 });
+			await chmod(file, 0o666);
 
-		assert.equal(await readConfig(home), undefined);
-	});
+			assert.equal(await readConfig(home), undefined);
+			assert.equal((await stat(home)).mode & 0o777, 0o700);
+			assert.equal((await stat(file)).mode & 0o777, 0o600);
+		},
+	);
 
-	it("returns undefined for schema-invalid config files", async () => {
-		const home = await tempHome();
-		await writeFile(join(home, "config.json"), JSON.stringify({ botToken: 5 }), "utf8");
+	it(
+		"repairs permissive permissions while reading schema-invalid config files",
+		{ skip: process.platform === "win32" ? "POSIX mode assertions do not apply on Windows" : false },
+		async () => {
+			const home = await tempHome();
+			const file = join(home, "config.json");
+			await chmod(home, 0o777);
+			await writeFile(file, JSON.stringify({ botToken: 5 }), { encoding: "utf8", mode: 0o666 });
+			await chmod(file, 0o666);
 
-		assert.equal(await readConfig(home), undefined);
-	});
+			assert.equal(await readConfig(home), undefined);
+			assert.equal((await stat(home)).mode & 0o777, 0o700);
+			assert.equal((await stat(file)).mode & 0o777, 0o600);
+		},
+	);
 
 	it("surfaces unexpected read errors", async () => {
 		const home = await tempHome();
@@ -112,10 +130,77 @@ describe("AFK config store", () => {
 		await assert.rejects(readConfig(home));
 	});
 
+	it(
+		"rejects existing non-empty AFK home directories with unrelated files without chmoding them",
+		{ skip: process.platform === "win32" ? "POSIX mode assertions do not apply on Windows" : false },
+		async () => {
+			const home = await tempHome();
+			await chmod(home, 0o777);
+			await writeFile(join(home, "unrelated.txt"), "do not touch", "utf8");
+
+			await assert.rejects(
+				writeConfig({ botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2 }, home),
+				/unsafe AFK home/i,
+			);
+			assert.equal((await stat(home)).mode & 0o777, 0o777);
+			await assert.rejects(readFile(join(home, "config.json"), "utf8"), { code: "ENOENT" });
+		},
+	);
+
+	it(
+		"rejects symlink AFK home paths",
+		{ skip: process.platform === "win32" ? "POSIX symlink assertions do not apply on Windows" : false },
+		async () => {
+			const base = await tempHome();
+			const target = join(base, "target");
+			const home = join(base, "link-home");
+			await mkdir(target);
+			await symlink(target, home, "dir");
+
+			await assert.rejects(
+				writeConfig({ botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2 }, home),
+				/symlink/i,
+			);
+			await assert.rejects(readFile(join(target, "config.json"), "utf8"), { code: "ENOENT" });
+		},
+	);
+
+	it("drops extra properties while reading valid config files", async () => {
+		const home = await tempHome();
+		await writeFile(
+			join(home, "config.json"),
+			JSON.stringify({ botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2, extra: "drop me" }),
+			"utf8",
+		);
+
+		assert.deepEqual(await readConfig(home), { botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2 });
+	});
+
+	it("drops extra properties while writing config files", async () => {
+		const home = await tempHome();
+		await writeConfig(
+			{ botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2, extra: "drop me" } as AfkConfig,
+			home,
+		);
+
+		assert.deepEqual(JSON.parse(await readFile(join(home, "config.json"), "utf8")), {
+			botToken: "123:secret",
+			botUsername: "bot",
+			chatId: 1,
+			userId: 2,
+		});
+	});
+
 	it("validates and redacts config", () => {
 		const config: AfkConfig = { botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2 };
 		assert.equal(isAfkConfig(config), true);
 		assert.equal(isAfkConfig({ botToken: "123:secret" }), false);
+		assert.deepEqual(redactConfig(config), { botToken: "<redacted>", botUsername: "bot", chatId: 1, userId: 2 });
+	});
+
+	it("drops extra properties while redacting config", () => {
+		const config = { botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2, extra: "drop me" } as AfkConfig;
+
 		assert.deepEqual(redactConfig(config), { botToken: "<redacted>", botUsername: "bot", chatId: 1, userId: 2 });
 	});
 

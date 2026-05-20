@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AfkConfig } from "./types.ts";
@@ -32,16 +32,67 @@ export function isAfkConfig(value: unknown): value is AfkConfig {
 	);
 }
 
-export async function readConfig(home = getAfkHome()): Promise<AfkConfig | undefined> {
+function cleanConfig(config: AfkConfig): AfkConfig {
+	return {
+		botToken: config.botToken,
+		botUsername: config.botUsername,
+		chatId: config.chatId,
+		userId: config.userId,
+	};
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+	return Boolean(error && typeof error === "object" && "code" in error && error.code === code);
+}
+
+function isAfkOwnedEntry(entry: string): boolean {
+	return entry === "config.json" || entry === "locks" || /^\.config\.json\..+\.tmp$/.test(entry);
+}
+
+async function validateExistingAfkHome(home: string): Promise<boolean> {
+	let stats;
 	try {
-		const raw = await readFile(configPath(home), "utf8");
+		stats = await lstat(home);
+	} catch (error) {
+		if (hasErrorCode(error, "ENOENT")) return false;
+		throw error;
+	}
+
+	if (stats.isSymbolicLink()) throw new Error(`Unsafe AFK home: ${home} is a symlink`);
+	if (!stats.isDirectory()) throw new Error(`Unsafe AFK home: ${home} is not a directory`);
+
+	const entries = await readdir(home);
+	const unrelatedEntry = entries.find((entry) => !isAfkOwnedEntry(entry));
+	if (unrelatedEntry) throw new Error(`Unsafe AFK home: contains unrelated entry ${unrelatedEntry}`);
+	return true;
+}
+
+async function prepareAfkHomeForWrite(home: string): Promise<void> {
+	const exists = await validateExistingAfkHome(home);
+	if (!exists) await mkdir(home, { recursive: true, mode: 0o700 });
+	await chmod(home, 0o700);
+}
+
+export async function readConfig(home = getAfkHome()): Promise<AfkConfig | undefined> {
+	const exists = await validateExistingAfkHome(home);
+	if (!exists) return undefined;
+
+	let raw;
+	try {
+		raw = await readFile(configPath(home), "utf8");
+	} catch (error) {
+		if (hasErrorCode(error, "ENOENT")) return undefined;
+		throw error;
+	}
+
+	await chmod(home, 0o700);
+	await chmod(configPath(home), 0o600);
+
+	try {
 		const parsed = JSON.parse(raw) as unknown;
 		if (!isAfkConfig(parsed)) return undefined;
-		await chmod(home, 0o700);
-		await chmod(configPath(home), 0o600);
-		return parsed;
+		return cleanConfig(parsed);
 	} catch (error) {
-		if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined;
 		if (error instanceof SyntaxError) return undefined;
 		throw error;
 	}
@@ -68,8 +119,7 @@ async function fsyncDirectory(path: string): Promise<void> {
 export async function writeConfig(config: AfkConfig, home = getAfkHome()): Promise<void> {
 	if (!isAfkConfig(config)) throw new Error("Invalid AFK config: refusing to write config.json");
 
-	await mkdir(home, { recursive: true, mode: 0o700 });
-	await chmod(home, 0o700);
+	await prepareAfkHomeForWrite(home);
 
 	const targetPath = configPath(home);
 	const tempPath = join(home, `.config.json.${process.pid}.${randomUUID()}.tmp`);
@@ -77,7 +127,7 @@ export async function writeConfig(config: AfkConfig, home = getAfkHome()): Promi
 
 	try {
 		handle = await open(tempPath, "wx", 0o600);
-		await handle.writeFile(`${JSON.stringify(config, null, 2)}\n`, "utf8");
+		await handle.writeFile(`${JSON.stringify(cleanConfig(config), null, 2)}\n`, "utf8");
 		await handle.sync();
 		await handle.close();
 		handle = undefined;
@@ -86,12 +136,15 @@ export async function writeConfig(config: AfkConfig, home = getAfkHome()): Promi
 		await chmod(targetPath, 0o600);
 		await fsyncDirectory(home);
 	} catch (error) {
-		await handle?.close();
-		await rm(tempPath, { force: true });
+		try {
+			await handle?.close();
+		} finally {
+			await rm(tempPath, { force: true });
+		}
 		throw error;
 	}
 }
 
 export function redactConfig(config: AfkConfig): Omit<AfkConfig, "botToken"> & { botToken: "<redacted>" } {
-	return { ...config, botToken: "<redacted>" };
+	return { ...cleanConfig(config), botToken: "<redacted>" };
 }
