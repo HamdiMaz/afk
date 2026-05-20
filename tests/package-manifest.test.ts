@@ -15,7 +15,7 @@ describe("package manifest", () => {
 			files?: string[];
 		};
 
-		assert.equal(packageJson.name, "afk");
+		assert.equal(packageJson.name, "pi-afk");
 		assert.equal(packageJson.type, "module");
 		assert.ok(packageJson.keywords?.includes("pi-package"));
 		assert.ok(packageJson.keywords?.includes("pi-extension"));
