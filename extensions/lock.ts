@@ -179,10 +179,18 @@ export class AfkLock {
 
 	async release(): Promise<void> {
 		if (!this.acquiredOwner) return;
-		const existing = await this.readExistingLock(this.path);
-		if (existing?.owner && sameOwner(existing.owner, this.acquiredOwner)) {
-			await rm(this.path, { recursive: true, force: true });
+		const claimPath = await this.claimLockDirectory("release");
+		if (!claimPath) {
+			this.acquiredOwner = undefined;
+			return;
+		}
+
+		const claimed = await this.readExistingLock(claimPath);
+		if (claimed?.owner && sameOwner(claimed.owner, this.acquiredOwner)) {
+			await rm(claimPath, { recursive: true, force: true });
 			await fsyncDirectory(this.lockDir);
+		} else {
+			await this.restoreClaimedLock(claimPath);
 		}
 		this.acquiredOwner = undefined;
 	}
@@ -264,21 +272,40 @@ export class AfkLock {
 	}
 
 	private async claimAndRemoveStaleLock(expected: { raw: string | undefined; owner: LockOwner | undefined }): Promise<boolean> {
-		const claimPath = join(this.lockDir, `.${basename(this.path)}.${process.pid}.${randomUUID()}.stale`);
-		try {
-			await rename(this.path, claimPath);
-			await fsyncDirectory(this.lockDir);
-		} catch (error) {
-			if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "EEXIST")) return false;
-			throw error;
-		}
+		const claimPath = await this.claimLockDirectory("stale");
+		if (!claimPath) return false;
 
 		const claimed = await this.readExistingLock(claimPath);
-		if (!claimed || !this.sameLockMetadata(claimed, expected)) return false;
+		if (!claimed || !this.sameLockMetadata(claimed, expected)) {
+			await this.restoreClaimedLock(claimPath);
+			return false;
+		}
 
 		await rm(claimPath, { recursive: true, force: true });
 		await fsyncDirectory(this.lockDir);
 		return true;
+	}
+
+	private async claimLockDirectory(reason: "release" | "stale"): Promise<string | undefined> {
+		const claimPath = join(this.lockDir, `.${basename(this.path)}.${process.pid}.${randomUUID()}.${reason}`);
+		try {
+			await rename(this.path, claimPath);
+			await fsyncDirectory(this.lockDir);
+			return claimPath;
+		} catch (error) {
+			if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "EEXIST")) return undefined;
+			throw error;
+		}
+	}
+
+	private async restoreClaimedLock(claimPath: string): Promise<void> {
+		try {
+			await rename(claimPath, this.path);
+			await fsyncDirectory(this.lockDir);
+		} catch (error) {
+			if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "EEXIST")) return;
+			throw error;
+		}
 	}
 
 	private sameLockMetadata(
