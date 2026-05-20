@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { ActiveTelegramQuestion } from "../extensions/ask-queue.ts";
-import { AfkController, toggleAfk } from "../extensions/controller.ts";
-import { writeConfig } from "../extensions/config.ts";
+import { AfkController, shutdownAfk, toggleAfk } from "../extensions/controller.ts";
+import { readConfig, writeConfig } from "../extensions/config.ts";
 import { buildCallbackData } from "../extensions/telegram-format.ts";
 import type { TelegramBridgeHandlers, TelegramBridgePort } from "../extensions/telegram.ts";
 import type { AfkConfig, AfkQuestion } from "../extensions/types.ts";
@@ -95,7 +95,7 @@ async function enabledController(): Promise<{ controller: AfkController; bridge:
 	return { controller, bridge, lock };
 }
 
-const fakeCommandCtx = () => {
+const fakeCommandCtx = (inputResult: string | undefined = undefined) => {
 	const notifications: Array<{ message: string; type?: "info" | "warning" | "error" }> = [];
 	const statuses: Array<{ key: string; text: string | undefined }> = [];
 	return {
@@ -104,6 +104,9 @@ const fakeCommandCtx = () => {
 		ctx: {
 			hasUI: true,
 			ui: {
+				async input() {
+					return inputResult;
+				},
 				notify(message: string, type?: "info" | "warning" | "error") {
 					notifications.push(type === undefined ? { message } : { message, type });
 				},
@@ -113,6 +116,14 @@ const fakeCommandCtx = () => {
 			},
 		} as unknown as ExtensionCommandContext,
 	};
+};
+
+const waitFor = async (condition: () => boolean, timeoutMs = 100): Promise<void> => {
+	const deadline = Date.now() + timeoutMs;
+	while (!condition()) {
+		if (Date.now() > deadline) throw new Error("Timed out waiting for condition");
+		await new Promise((resolve) => setTimeout(resolve, 1));
+	}
 };
 
 describe("AfkController", () => {
@@ -169,6 +180,54 @@ describe("AfkController", () => {
 			ok: false,
 			reason: "Telegram is not configured. Run /afk-settings first.",
 		});
+	});
+
+	it("enable releases lock and stops bridge when bridge start throws", async () => {
+		const home = await tempHome();
+		await writeConfig(config, home);
+		let lock: FakeLock | undefined;
+		let bridge: ThrowingStartBridge | undefined;
+		class ThrowingStartBridge extends FakeBridge {
+			override start(): void {
+				this.started = true;
+				throw new Error("start failed");
+			}
+		}
+		const controller = new AfkController({
+			home,
+			createBridge: (_token, handlers) => (bridge = new ThrowingStartBridge(handlers)),
+			createLock: () => (lock = new FakeLock({ ok: true })),
+		});
+
+		await assert.rejects(() => controller.enable(), /start failed/);
+
+		assert.equal(controller.isAfkEnabled, false);
+		assert.equal(bridge?.stopped, true);
+		assert.equal(lock?.released, true);
+	});
+
+	it("enable releases lock and stops bridge when bridge start rejects", async () => {
+		const home = await tempHome();
+		await writeConfig(config, home);
+		let lock: FakeLock | undefined;
+		let bridge: RejectingStartBridge | undefined;
+		class RejectingStartBridge extends FakeBridge {
+			override start(): void {
+				this.started = true;
+				return Promise.reject(new Error("start rejected")) as unknown as void;
+			}
+		}
+		const controller = new AfkController({
+			home,
+			createBridge: (_token, handlers) => (bridge = new RejectingStartBridge(handlers)),
+			createLock: () => (lock = new FakeLock({ ok: true })),
+		});
+
+		await assert.rejects(() => controller.enable(), /start rejected/);
+
+		assert.equal(controller.isAfkEnabled, false);
+		assert.equal(bridge?.stopped, true);
+		assert.equal(lock?.released, true);
 	});
 
 	it("notify sends Telegram message when enabled", async () => {
@@ -274,6 +333,117 @@ describe("AfkController", () => {
 		assert.deepEqual(bridge.messages, [{ chatId: config.chatId, text: "AFK question cancelled: AFK disabled" }]);
 		assert.equal(bridge.stopped, true);
 		assert.equal(lock.released, true);
+	});
+
+	it("executeTool returns cancelled details when ask signal aborts", async () => {
+		const { controller, bridge } = await enabledController();
+		const abortController = new AbortController();
+		const resultPromise = controller.executeTool({ mode: "ask", questions: [question()] }, abortController.signal);
+		await flushAsync();
+
+		abortController.abort("agent cancelled");
+		const result = await resultPromise;
+
+		assert.deepEqual(result.details, { mode: "cancelled", reason: "agent cancelled" });
+		assert.deepEqual(bridge.messages, [{ chatId: config.chatId, text: "AFK question cancelled: agent cancelled" }]);
+	});
+
+	it("enabled bridge polling error disables AFK and releases lock", async () => {
+		const { controller, bridge, lock } = await enabledController();
+
+		bridge.handlers.onPollingError?.(new Error("poll failed"));
+		await waitFor(() => lock.released);
+
+		assert.equal(controller.isAfkEnabled, false);
+		assert.equal(bridge.stopped, true);
+		assert.equal(lock.released, true);
+	});
+
+	it("shutdownAfk clears status and disables/releases AFK", async () => {
+		const { controller, bridge, lock } = await enabledController();
+		const { ctx, statuses } = fakeCommandCtx();
+
+		await shutdownAfk(controller, ctx, "test shutdown");
+
+		assert.equal(controller.isAfkEnabled, false);
+		assert.equal(bridge.stopped, true);
+		assert.equal(lock.released, true);
+		assert.deepEqual(statuses, [{ key: "afk", text: undefined }]);
+	});
+
+	it("runSettings cancelled token prompt returns without starting bridge and notifies cancellation", async () => {
+		let created = false;
+		const { ctx, notifications } = fakeCommandCtx(undefined);
+		const controller = new AfkController({
+			home: await tempHome(),
+			createBridge: (_token, handlers) => {
+				created = true;
+				return new FakeBridge(handlers);
+			},
+		});
+
+		await controller.runSettings(ctx);
+
+		assert.equal(created, false);
+		assert.deepEqual(notifications, [{ message: "AFK settings cancelled.", type: "warning" }]);
+	});
+
+	it("runSettings successful link writes config and stops bridge", async () => {
+		const home = await tempHome();
+		let bridge: FakeBridge | undefined;
+		const { ctx, notifications } = fakeCommandCtx("999:token");
+		const controller = new AfkController({
+			home,
+			settingsLinkTimeoutMs: 100,
+			settingsPollIntervalMs: 1,
+			createBridge: (_token, handlers) => (bridge = new FakeBridge(handlers)),
+		});
+
+		const settingsPromise = controller.runSettings(ctx);
+		await waitFor(() => notifications.some(({ message }) => message.includes("Send this one-time code")));
+		const code = notifications.find(({ message }) => message.includes("Send this one-time code"))?.message.match(/AFK-\d{6}/)?.[0];
+		assert.ok(code);
+		await bridge?.handlers.onText?.({ chatId: 123, userId: 456, text: code, isPrivate: true });
+		await settingsPromise;
+
+		assert.deepEqual(await readConfig(home), { botToken: "999:token", botUsername: "fake_bot", chatId: 123, userId: 456 });
+		assert.equal(bridge?.stopped, true);
+		assert.deepEqual(notifications.at(-1), { message: "AFK Telegram settings saved.", type: "info" });
+	});
+
+	it("runSettings wrong or no code times out and stops bridge with warning", async () => {
+		let bridge: FakeBridge | undefined;
+		const { ctx, notifications } = fakeCommandCtx("999:token");
+		const controller = new AfkController({
+			home: await tempHome(),
+			settingsLinkTimeoutMs: 5,
+			settingsPollIntervalMs: 1,
+			createBridge: (_token, handlers) => (bridge = new FakeBridge(handlers)),
+		});
+
+		await controller.runSettings(ctx);
+
+		assert.equal(bridge?.stopped, true);
+		assert.deepEqual(notifications.at(-1), { message: "AFK Telegram link timed out.", type: "warning" });
+	});
+
+	it("runSettings polling error stops bridge and notifies warning", async () => {
+		let bridge: FakeBridge | undefined;
+		const { ctx, notifications } = fakeCommandCtx("999:token");
+		const controller = new AfkController({
+			home: await tempHome(),
+			settingsLinkTimeoutMs: 100,
+			settingsPollIntervalMs: 1,
+			createBridge: (_token, handlers) => (bridge = new FakeBridge(handlers)),
+		});
+
+		const settingsPromise = controller.runSettings(ctx);
+		await waitFor(() => notifications.some(({ message }) => message.includes("Send this one-time code")));
+		bridge?.handlers.onPollingError?.(new Error("poll failed"));
+		await settingsPromise;
+
+		assert.equal(bridge?.stopped, true);
+		assert.deepEqual(notifications.at(-1), { message: "AFK Telegram polling failed during settings link.", type: "warning" });
 	});
 
 	it("toggleAfk sets status and notifications for enable and disable", async () => {

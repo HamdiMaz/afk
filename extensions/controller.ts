@@ -20,6 +20,8 @@ export interface AfkLockPort {
 
 export interface AfkControllerOptions {
 	home?: string;
+	settingsLinkTimeoutMs?: number;
+	settingsPollIntervalMs?: number;
 	createBridge?: (token: string, handlers: TelegramBridgeHandlers) => TelegramBridgePort;
 	createLock?: (token: string, home: string) => AfkLockPort;
 }
@@ -34,11 +36,15 @@ export interface AfkToolResponse {
 const NO_CONFIG_REASON = "Telegram is not configured. Run /afk-settings first.";
 const DISABLED_REASON = "AFK mode is off";
 const NO_PENDING_MESSAGE = "No AFK question is pending right now. Use Pi locally, or wait for the agent to ask something.";
+const DEFAULT_SETTINGS_LINK_TIMEOUT_MS = 120_000;
+const DEFAULT_SETTINGS_POLL_INTERVAL_MS = 250;
 
 export class AfkController implements AskQueueTransport {
 	private readonly home: string;
 	private readonly createBridge: (token: string, handlers: TelegramBridgeHandlers) => TelegramBridgePort;
 	private readonly createLock: (token: string, home: string) => AfkLockPort;
+	private readonly settingsLinkTimeoutMs: number;
+	private readonly settingsPollIntervalMs: number;
 	private config: AfkConfig | undefined;
 	private bridge: TelegramBridgePort | undefined;
 	private lock: AfkLockPort | undefined;
@@ -47,6 +53,8 @@ export class AfkController implements AskQueueTransport {
 
 	constructor(options: AfkControllerOptions = {}) {
 		this.home = options.home ?? getAfkHome();
+		this.settingsLinkTimeoutMs = options.settingsLinkTimeoutMs ?? DEFAULT_SETTINGS_LINK_TIMEOUT_MS;
+		this.settingsPollIntervalMs = options.settingsPollIntervalMs ?? DEFAULT_SETTINGS_POLL_INTERVAL_MS;
 		this.createBridge = options.createBridge ?? ((token, handlers) => new TelegramBridge(token, handlers));
 		this.createLock = options.createLock ?? ((token, home) => new AfkLock(token, home));
 		this.askQueue = new AskQueue(this);
@@ -66,16 +74,25 @@ export class AfkController implements AskQueueTransport {
 		const acquired = await lock.acquire();
 		if (!acquired.ok) return { ok: false, reason: acquired.reason };
 
+		let bridge: TelegramBridgePort | undefined;
 		try {
-			const bridge = this.createBridge(config.botToken, this.handlers());
-			bridge.start();
+			bridge = this.createBridge(config.botToken, this.handlers());
 			this.config = config;
 			this.lock = lock;
 			this.bridge = bridge;
+			await Promise.resolve((bridge.start as () => void | Promise<void>)());
 			this.afkEnabled = true;
 			return { ok: true };
 		} catch (error) {
-			await lock.release();
+			try {
+				bridge?.stop();
+			} finally {
+				await lock.release();
+				this.config = undefined;
+				this.lock = undefined;
+				this.bridge = undefined;
+				this.afkEnabled = false;
+			}
 			throw error;
 		}
 	}
@@ -163,27 +180,49 @@ export class AfkController implements AskQueueTransport {
 
 		const code = `AFK-${Math.floor(100_000 + Math.random() * 900_000)}`;
 		let linked = false;
-		const bridge = this.createBridge(token, {
-			onText: async (message) => {
-				if (!message.isPrivate || message.text.trim() !== code) return;
-				const me = await bridge.getMe();
-				await writeConfig(
-					{ botToken: token, botUsername: me.username, chatId: message.chatId, userId: message.userId },
-					this.home,
-				);
-				await bridge.sendMessage(message.chatId, "AFK linked successfully ✅");
-				linked = true;
-			},
-		});
+		let pollingError: unknown;
+		let bridge: TelegramBridgePort | undefined;
 
 		try {
+			bridge = this.createBridge(token, {
+				onText: async (message) => {
+					if (!message.isPrivate || message.text.trim() !== code || !bridge) return;
+					const me = await bridge.getMe();
+					await writeConfig(
+						{ botToken: token, botUsername: me.username, chatId: message.chatId, userId: message.userId },
+						this.home,
+					);
+					await bridge.sendMessage(message.chatId, "AFK linked successfully ✅");
+					linked = true;
+				},
+				onPollingError: (error) => {
+					pollingError = error;
+				},
+			});
+
 			const me = await bridge.getMe();
-			bridge.start();
+			await Promise.resolve((bridge.start as () => void | Promise<void>)());
 			ctx.ui.notify(`Send this one-time code to @${me.username}: ${code}`, "info");
-			while (!linked) await new Promise((resolve) => setTimeout(resolve, 250));
+
+			const deadline = Date.now() + this.settingsLinkTimeoutMs;
+			while (!linked) {
+				if (pollingError) {
+					ctx.ui.notify("AFK Telegram polling failed during settings link.", "warning");
+					return;
+				}
+				if (Date.now() >= deadline) {
+					ctx.ui.notify("AFK Telegram link timed out.", "warning");
+					return;
+				}
+				await new Promise((resolve) =>
+					setTimeout(resolve, Math.max(1, Math.min(this.settingsPollIntervalMs, deadline - Date.now()))),
+				);
+			}
 			ctx.ui.notify("AFK Telegram settings saved.", "info");
+		} catch {
+			ctx.ui.notify("AFK Telegram settings failed.", "error");
 		} finally {
-			bridge.stop();
+			bridge?.stop();
 		}
 	}
 
@@ -191,6 +230,9 @@ export class AfkController implements AskQueueTransport {
 		return {
 			onText: (message) => this.handleText(message),
 			onCallback: (callback) => this.handleCallback(callback),
+			onPollingError: () => {
+				void this.disable("AFK Telegram polling failed").catch(() => {});
+			},
 		};
 	}
 

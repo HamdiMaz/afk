@@ -39,6 +39,12 @@ export class AfkAskCancelledError extends Error {
 	}
 }
 
+const abortReason = (signal: AbortSignal): string => {
+	const { reason } = signal;
+	if (typeof reason === "string" && reason.trim()) return reason;
+	return "AFK ask was aborted";
+};
+
 export class AskQueue {
 	private readonly queue: QueuedAsk[] = [];
 	private active: ActiveAsk | undefined;
@@ -69,19 +75,20 @@ export class AskQueue {
 				removeAbortListener: () => {},
 			};
 			const abort = () => {
+				const reason = signal ? abortReason(signal) : "AFK ask was aborted";
 				if (this.active?.requestId === request.requestId) {
-					this.cancelActive("AFK ask was aborted");
+					this.cancelActive(reason);
 					return;
 				}
 
 				if (this.removeQueued(request.requestId)) {
 					request.removeAbortListener();
-					reject(new AfkAskCancelledError("AFK ask was aborted"));
+					reject(new AfkAskCancelledError(reason));
 				}
 			};
 
 			if (signal?.aborted) {
-				reject(new AfkAskCancelledError("AFK ask was aborted"));
+				reject(new AfkAskCancelledError(abortReason(signal)));
 				return;
 			}
 
