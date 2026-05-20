@@ -91,6 +91,8 @@ export async function readConfig(home = getAfkHome()): Promise<AfkConfig | undef
 	const exists = await validateExistingAfkHome(home);
 	if (!exists) return undefined;
 
+	await chmod(home, 0o700);
+
 	const targetPath = configPath(home);
 	const configExists = await validateConfigFile(targetPath);
 	if (!configExists) return undefined;
@@ -103,7 +105,6 @@ export async function readConfig(home = getAfkHome()): Promise<AfkConfig | undef
 		throw error;
 	}
 
-	await chmod(home, 0o700);
 	await validateConfigFile(targetPath);
 	await chmod(targetPath, 0o600);
 
