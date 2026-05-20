@@ -21,6 +21,11 @@ describe("AFK config store", () => {
 		assert.equal(home, "/tmp/custom-afk");
 	});
 
+	it("trims PI_AFK_HOME overrides", () => {
+		const home = getAfkHome({ PI_AFK_HOME: "  /tmp/custom-afk  ", HOME: "/home/test-user" });
+		assert.equal(home, "/tmp/custom-afk");
+	});
+
 	it("returns undefined when config does not exist", async () => {
 		const home = await tempHome();
 		assert.equal(await readConfig(home), undefined);
@@ -42,6 +47,16 @@ describe("AFK config store", () => {
 		assert.match(raw, /afk_test_bot/);
 	});
 
+	it("rejects invalid config writes without creating config.json", async () => {
+		const home = await tempHome();
+		await assert.rejects(
+			writeConfig({ botToken: "   ", botUsername: "bot", chatId: 1, userId: 2 } as AfkConfig, home),
+			/Invalid AFK config/,
+		);
+
+		await assert.rejects(readFile(join(home, "config.json"), "utf8"), { code: "ENOENT" });
+	});
+
 	it(
 		"creates and enforces restrictive config directory and file permissions",
 		{ skip: process.platform === "win32" ? "POSIX mode assertions do not apply on Windows" : false },
@@ -54,6 +69,23 @@ describe("AFK config store", () => {
 
 			await writeConfig({ botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2 }, home);
 
+			assert.equal((await stat(home)).mode & 0o777, 0o700);
+			assert.equal((await stat(file)).mode & 0o777, 0o600);
+		},
+	);
+
+	it(
+		"repairs permissive config directory and file permissions while reading valid config",
+		{ skip: process.platform === "win32" ? "POSIX mode assertions do not apply on Windows" : false },
+		async () => {
+			const home = await tempHome();
+			const file = join(home, "config.json");
+			const config: AfkConfig = { botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2 };
+			await chmod(home, 0o777);
+			await writeFile(file, JSON.stringify(config), { encoding: "utf8", mode: 0o666 });
+			await chmod(file, 0o666);
+
+			assert.deepEqual(await readConfig(home), config);
 			assert.equal((await stat(home)).mode & 0o777, 0o700);
 			assert.equal((await stat(file)).mode & 0o777, 0o600);
 		},
@@ -87,12 +119,23 @@ describe("AFK config store", () => {
 		assert.deepEqual(redactConfig(config), { botToken: "<redacted>", botUsername: "bot", chatId: 1, userId: 2 });
 	});
 
-	it("rejects fractional or unsafe Telegram IDs", () => {
+	it("rejects fractional, unsafe, or non-positive Telegram IDs", () => {
 		const base = { botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2 };
 
 		assert.equal(isAfkConfig({ ...base, chatId: 1.5 }), false);
 		assert.equal(isAfkConfig({ ...base, userId: 2.5 }), false);
 		assert.equal(isAfkConfig({ ...base, chatId: Number.MAX_SAFE_INTEGER + 1 }), false);
 		assert.equal(isAfkConfig({ ...base, userId: Number.MAX_SAFE_INTEGER + 1 }), false);
+		assert.equal(isAfkConfig({ ...base, chatId: 0 }), false);
+		assert.equal(isAfkConfig({ ...base, userId: 0 }), false);
+		assert.equal(isAfkConfig({ ...base, chatId: -1 }), false);
+		assert.equal(isAfkConfig({ ...base, userId: -1 }), false);
+	});
+
+	it("rejects whitespace-only bot tokens and usernames", () => {
+		const base = { botToken: "123:secret", botUsername: "bot", chatId: 1, userId: 2 };
+
+		assert.equal(isAfkConfig({ ...base, botToken: "   " }), false);
+		assert.equal(isAfkConfig({ ...base, botUsername: "\t\n" }), false);
 	});
 });
