@@ -3,8 +3,15 @@ import { describe, it } from "node:test";
 import type { ActiveTelegramQuestion } from "../extensions/ask-queue.ts";
 import { TelegramBridge } from "../extensions/telegram.ts";
 
+interface FakeTelegramContext {
+	chat: { id: number; type?: string };
+	from: { id: number };
+	message: { text: string };
+	callbackQuery: { id: string; data: string; message?: { chat: { id: number } } };
+}
+
 class FakeBot {
-	readonly handlers = new Map<string, (ctx: any) => Promise<void> | void>();
+	readonly handlers = new Map<string, (ctx: unknown) => Promise<void> | void>();
 	readonly sentMessages: Array<{ chatId: number; text: string; options?: unknown }> = [];
 	readonly answeredCallbacks: Array<{ callbackQueryId: string; options?: unknown }> = [];
 	startCalls = 0;
@@ -20,8 +27,8 @@ class FakeBot {
 		},
 	};
 
-	on(event: string, handler: (ctx: any) => Promise<void> | void): void {
-		this.handlers.set(event, handler);
+	on(event: "message:text" | "callback_query:data", handler: (ctx: FakeTelegramContext) => Promise<void> | void): void {
+		this.handlers.set(event, (ctx: unknown) => handler(ctx as FakeTelegramContext));
 	}
 
 	catch(handler: (error: unknown) => void): void {
