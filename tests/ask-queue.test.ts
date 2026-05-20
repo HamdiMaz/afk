@@ -15,15 +15,30 @@ const question = (id: string, text = `Question ${id}`): AfkQuestion => ({
 class FakeTransport implements AskQueueTransport {
 	readonly sent: ActiveTelegramQuestion[] = [];
 	readonly cancellations: string[] = [];
+	sendQuestionFailures: Array<Error | undefined> = [];
+	sendCancellationFailure: Error | undefined;
 
 	async sendQuestion(active: ActiveTelegramQuestion): Promise<void> {
 		this.sent.push(active);
+		const failure = this.sendQuestionFailures.shift();
+		if (failure) throw failure;
 	}
 
 	async sendCancellation(reason: string): Promise<void> {
 		this.cancellations.push(reason);
+		if (this.sendCancellationFailure) throw this.sendCancellationFailure;
 	}
 }
+
+const rejectsSoon = async (promise: Promise<unknown>, expected: RegExp | typeof Error): Promise<void> => {
+	await assert.rejects(
+		Promise.race([
+			promise,
+			new Promise((_, reject) => setTimeout(() => reject(new Error("Promise did not reject")), 50)),
+		]),
+		expected,
+	);
+};
 
 describe("AskQueue", () => {
 	it("resolves a button answer", async () => {
@@ -126,6 +141,95 @@ describe("AskQueue", () => {
 		await assert.rejects(second, AfkAskCancelledError);
 		assert.deepEqual(transport.cancellations, ["AFK disabled"]);
 		assert.equal(queue.hasPendingQuestion, false);
+	});
+
+	it("rejects an ask when sending its first question fails and continues with the next ask", async () => {
+		const transport = new FakeTransport();
+		transport.sendQuestionFailures.push(new Error("telegram down"));
+		const nonces = ["n1", "n2"];
+		const queue = new AskQueue(transport, { makeNonce: () => nonces.shift() ?? "missing" });
+
+		const failed = queue.enqueue([question("failed")]);
+		const next = queue.enqueue([question("next")]);
+
+		await rejectsSoon(failed, /telegram down/);
+		assert.equal(queue.hasPendingQuestion, true);
+		assert.equal(transport.sent.length, 2);
+		assert.equal(transport.sent[1]?.question.id, "next");
+
+		assert.equal(await queue.answerWithOption("n2", 0), true);
+		assert.deepEqual(await next, [{ id: "next", value: "yes", label: "Yes", wasCustom: false }]);
+		assert.equal(queue.hasPendingQuestion, false);
+	});
+
+	it("rejects an active ask when sending a later question fails and continues with the next ask", async () => {
+		const transport = new FakeTransport();
+		transport.sendQuestionFailures.push(undefined, new Error("second send failed"));
+		const nonces = ["n1", "n2", "n3"];
+		const queue = new AskQueue(transport, { makeNonce: () => nonces.shift() ?? "missing" });
+
+		const failed = queue.enqueue([question("first"), question("second")]);
+		const next = queue.enqueue([question("next")]);
+
+		assert.equal(await queue.answerWithOption("n1", 0), true);
+		await rejectsSoon(failed, /second send failed/);
+		assert.equal(queue.hasPendingQuestion, true);
+		assert.equal(transport.sent.length, 3);
+		assert.equal(transport.sent[2]?.question.id, "next");
+
+		assert.equal(await queue.answerWithOption("n3", 1), true);
+		assert.deepEqual(await next, [{ id: "next", value: "no", label: "No", wasCustom: false }]);
+	});
+
+	it("rejects a queued ask when its abort signal fires without affecting the active ask", async () => {
+		const transport = new FakeTransport();
+		const nonces = ["n1", "n2"];
+		const queue = new AskQueue(transport, { makeNonce: () => nonces.shift() ?? "missing" });
+		const controller = new AbortController();
+
+		const active = queue.enqueue([question("active")]);
+		const queued = queue.enqueue([question("queued")], controller.signal);
+		controller.abort();
+
+		await assert.rejects(queued, AfkAskCancelledError);
+		assert.equal(queue.hasPendingQuestion, true);
+		assert.deepEqual(transport.cancellations, []);
+		assert.equal(await queue.answerWithOption("n1", 0), true);
+		assert.deepEqual(await active, [{ id: "active", value: "yes", label: "Yes", wasCustom: false }]);
+		assert.equal(queue.hasPendingQuestion, false);
+	});
+
+	it("rejects asks even when cancellation transport fails", async () => {
+		const transport = new FakeTransport();
+		transport.sendCancellationFailure = new Error("cancel send failed");
+		const queue = new AskQueue(transport, { makeNonce: () => "n1" });
+
+		const first = queue.enqueue([question("first")]);
+		const second = queue.enqueue([question("second")]);
+		queue.cancelAll("AFK disabled");
+
+		await assert.rejects(first, AfkAskCancelledError);
+		await assert.rejects(second, AfkAskCancelledError);
+		assert.deepEqual(transport.cancellations, ["AFK disabled"]);
+		assert.equal(queue.hasPendingQuestion, false);
+	});
+
+	it("uses the questions snapshot from enqueue time for queued asks", async () => {
+		const transport = new FakeTransport();
+		const nonces = ["n1", "n2"];
+		const queue = new AskQueue(transport, { makeNonce: () => nonces.shift() ?? "missing" });
+		const queuedQuestions = [question("queued")];
+
+		const active = queue.enqueue([question("active")]);
+		const queued = queue.enqueue(queuedQuestions);
+		queuedQuestions[0] = question("mutated");
+
+		assert.equal(await queue.answerWithOption("n1", 0), true);
+		await active;
+		assert.equal(transport.sent[1]?.question.id, "queued");
+
+		assert.equal(await queue.answerWithOption("n2", 0), true);
+		assert.deepEqual(await queued, [{ id: "queued", value: "yes", label: "Yes", wasCustom: false }]);
 	});
 
 	it("rejects empty question lists", async () => {

@@ -59,7 +59,10 @@ export class AskQueue {
 		return new Promise<AfkAnswer[]>((resolve, reject) => {
 			const request: QueuedAsk = {
 				requestId: randomUUID(),
-				questions,
+				questions: questions.map((item) => ({
+					...item,
+					options: item.options.map((option) => ({ ...option })),
+				})),
 				answers: [],
 				resolve,
 				reject,
@@ -135,7 +138,7 @@ export class AskQueue {
 			item.reject(error);
 		}
 
-		if (hadActive) void this.transport.sendCancellation(reason);
+		if (hadActive) void this.transport.sendCancellation(reason).catch(() => {});
 	}
 
 	get hasPendingQuestion(): boolean {
@@ -149,7 +152,11 @@ export class AskQueue {
 		if (!next) return;
 
 		this.active = { ...next, questionIndex: 0, nonce: this.makeNonce() };
-		await this.sendActiveQuestion();
+		try {
+			await this.sendActiveQuestion();
+		} catch (error) {
+			await this.rejectActiveAndPump(error);
+		}
 	}
 
 	private async sendActiveQuestion(): Promise<void> {
@@ -182,7 +189,11 @@ export class AskQueue {
 
 		active.questionIndex += 1;
 		active.nonce = this.makeNonce();
-		await this.sendActiveQuestion();
+		try {
+			await this.sendActiveQuestion();
+		} catch (error) {
+			await this.rejectActiveAndPump(error);
+		}
 	}
 
 	private removeQueued(requestId: string): boolean {
@@ -199,7 +210,17 @@ export class AskQueue {
 		active.removeAbortListener();
 		active.reject(new AfkAskCancelledError(reason));
 		this.active = undefined;
-		void this.transport.sendCancellation(reason);
+		void this.transport.sendCancellation(reason).catch(() => {});
 		void this.pump();
+	}
+
+	private async rejectActiveAndPump(error: unknown): Promise<void> {
+		const active = this.active;
+		if (!active) return;
+
+		active.removeAbortListener();
+		active.reject(error instanceof Error ? error : new Error(String(error)));
+		this.active = undefined;
+		await this.pump();
 	}
 }
