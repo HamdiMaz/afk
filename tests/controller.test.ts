@@ -78,13 +78,14 @@ const flushAsync = async (): Promise<void> => {
 	await new Promise((resolve) => setImmediate(resolve));
 };
 
-async function enabledController(): Promise<{ controller: AfkController; bridge: FakeBridge; lock: FakeLock }> {
+async function enabledController(options: Partial<ConstructorParameters<typeof AfkController>[0]> = {}): Promise<{ controller: AfkController; bridge: FakeBridge; lock: FakeLock }> {
 	const home = await tempHome();
 	await writeConfig(config, home);
 	let bridge: FakeBridge | undefined;
 	let lock: FakeLock | undefined;
 	const controller = new AfkController({
 		home,
+		...options,
 		createBridge: (_token, handlers) => (bridge = new FakeBridge(handlers)),
 		createLock: () => (lock = new FakeLock({ ok: true })),
 	});
@@ -279,7 +280,7 @@ describe("AfkController", () => {
 		assert.deepEqual(bridge.callbacks, [{ callbackQueryId: "cb-1", text: "Answer received" }]);
 	});
 
-	it("ignores unrelated Telegram text and callback", async () => {
+	it("acknowledges unauthorized callback and ignores unrelated Telegram text", async () => {
 		const { controller, bridge } = await enabledController();
 		const resultPromise = controller.executeTool({ mode: "ask", questions: [question()] });
 		await flushAsync();
@@ -294,7 +295,7 @@ describe("AfkController", () => {
 			userId: config.userId,
 			data: buildCallbackData(active.nonce, 0),
 		});
-		assert.equal(bridge.callbacks.length, 0);
+		assert.deepEqual(bridge.callbacks, [{ callbackQueryId: "cb-unlinked", text: "Unauthorized AFK answer" }]);
 
 		await bridge.handlers.onCallback?.({
 			callbackQueryId: "cb-real",
@@ -348,15 +349,21 @@ describe("AfkController", () => {
 		assert.deepEqual(bridge.messages, [{ chatId: config.chatId, text: "AFK question cancelled: agent cancelled" }]);
 	});
 
-	it("enabled bridge polling error disables AFK and releases lock", async () => {
-		const { controller, bridge, lock } = await enabledController();
+	it("enabled bridge polling error invokes onDisabled callback, disables AFK, and releases lock", async () => {
+		const disabledReasons: string[] = [];
+		const { controller, bridge, lock } = await enabledController({
+			onDisabled: (reason) => {
+				disabledReasons.push(reason);
+			},
+		});
 
 		bridge.handlers.onPollingError?.(new Error("poll failed"));
-		await waitFor(() => lock.released);
+		await waitFor(() => lock.released && disabledReasons.length === 1);
 
 		assert.equal(controller.isAfkEnabled, false);
 		assert.equal(bridge.stopped, true);
 		assert.equal(lock.released, true);
+		assert.deepEqual(disabledReasons, ["AFK Telegram polling failed"]);
 	});
 
 	it("shutdownAfk clears status and disables/releases AFK", async () => {

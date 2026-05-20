@@ -24,6 +24,7 @@ export interface AfkControllerOptions {
 	settingsPollIntervalMs?: number;
 	createBridge?: (token: string, handlers: TelegramBridgeHandlers) => TelegramBridgePort;
 	createLock?: (token: string, home: string) => AfkLockPort;
+	onDisabled?: (reason: string) => void | Promise<void>;
 }
 
 export type EnableResult = { ok: true } | { ok: false; reason: string };
@@ -43,6 +44,7 @@ export class AfkController implements AskQueueTransport {
 	private readonly home: string;
 	private readonly createBridge: (token: string, handlers: TelegramBridgeHandlers) => TelegramBridgePort;
 	private readonly createLock: (token: string, home: string) => AfkLockPort;
+	private readonly onDisabled: ((reason: string) => void | Promise<void>) | undefined;
 	private readonly settingsLinkTimeoutMs: number;
 	private readonly settingsPollIntervalMs: number;
 	private config: AfkConfig | undefined;
@@ -57,6 +59,7 @@ export class AfkController implements AskQueueTransport {
 		this.settingsPollIntervalMs = options.settingsPollIntervalMs ?? DEFAULT_SETTINGS_POLL_INTERVAL_MS;
 		this.createBridge = options.createBridge ?? ((token, handlers) => new TelegramBridge(token, handlers));
 		this.createLock = options.createLock ?? ((token, home) => new AfkLock(token, home));
+		this.onDisabled = options.onDisabled;
 		this.askQueue = new AskQueue(this);
 	}
 
@@ -231,7 +234,10 @@ export class AfkController implements AskQueueTransport {
 			onText: (message) => this.handleText(message),
 			onCallback: (callback) => this.handleCallback(callback),
 			onPollingError: () => {
-				void this.disable("AFK Telegram polling failed").catch(() => {});
+				const reason = "AFK Telegram polling failed";
+				void this.disable(reason)
+					.then(() => this.onDisabled?.(reason))
+					.catch(() => {});
 			},
 		};
 	}
@@ -246,7 +252,10 @@ export class AfkController implements AskQueueTransport {
 
 	private async handleCallback(callback: LinkedTelegramCallback): Promise<void> {
 		if (!this.config || !this.bridge) return;
-		if (callback.chatId !== this.config.chatId || callback.userId !== this.config.userId) return;
+		if (callback.chatId !== this.config.chatId || callback.userId !== this.config.userId) {
+			await this.bridge.answerCallback(callback.callbackQueryId, "Unauthorized AFK answer");
+			return;
+		}
 
 		const parsed = parseCallbackData(callback.data);
 		if (!parsed) {

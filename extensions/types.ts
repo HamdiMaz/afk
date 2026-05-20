@@ -23,16 +23,16 @@ export interface LinkedTelegramCallback {
 }
 
 export const AfkOptionSchema = Type.Object({
-	label: Type.String({ description: "Button label shown in Telegram" }),
-	value: Type.String({ description: "Value returned to the agent if selected" }),
+	label: Type.String({ minLength: 1, description: "Button label shown in Telegram" }),
+	value: Type.String({ minLength: 1, description: "Value returned to the agent if selected" }),
 	description: Type.Optional(Type.String({ description: "Optional context shown in the Telegram message body" })),
 	recommended: Type.Optional(Type.Boolean({ description: "Marks this option as recommended in Telegram" })),
 });
 
 export const AfkQuestionSchema = Type.Object({
-	id: Type.String({ description: "Stable identifier used in the returned answer" }),
-	question: Type.String({ description: "Question text sent to Telegram" }),
-	options: Type.Array(AfkOptionSchema, { description: "Single-select answer options" }),
+	id: Type.String({ minLength: 1, description: "Stable identifier used in the returned answer" }),
+	question: Type.String({ minLength: 1, description: "Question text sent to Telegram" }),
+	options: Type.Array(AfkOptionSchema, { minItems: 1, description: "Single-select answer options" }),
 });
 
 export const AfkToolParamsSchema = Type.Object({

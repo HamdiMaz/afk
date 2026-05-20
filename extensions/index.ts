@@ -1,4 +1,4 @@
-import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { AfkController, shutdownAfk, toggleAfk } from "./controller.ts";
 import { AfkToolParamsSchema, type AfkToolDetails, type AfkToolParams } from "./types.ts";
@@ -25,11 +25,21 @@ function describeResult(result: AgentToolResult<AfkToolDetails>): string {
 
 /** AFK extension entry point. */
 export default function extension(pi: ExtensionAPI): void {
-	const controller = new AfkController();
+	let latestUi: ExtensionContext["ui"] | undefined;
+	const captureUi = (ctx: ExtensionContext): void => {
+		latestUi = ctx.ui;
+	};
+	const controller = new AfkController({
+		onDisabled(reason) {
+			latestUi?.setStatus("afk", undefined);
+			latestUi?.notify(reason, "warning");
+		},
+	});
 
 	pi.registerCommand("afk", {
 		description: "Toggle AFK mode and Telegram relay",
 		handler: async (_args, ctx) => {
+			captureUi(ctx);
 			await toggleAfk(controller, ctx);
 		},
 	});
@@ -37,6 +47,7 @@ export default function extension(pi: ExtensionAPI): void {
 	pi.registerCommand("afk-settings", {
 		description: "Configure AFK Telegram settings",
 		handler: async (_args, ctx) => {
+			captureUi(ctx);
 			await controller.runSettings(ctx);
 		},
 	});
@@ -69,6 +80,7 @@ export default function extension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
+		captureUi(ctx);
 		await shutdownAfk(controller, ctx, event.reason);
 	});
 }
